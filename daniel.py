@@ -28,6 +28,8 @@ DEFAULTS = {
     "claude_mode": "cli",
     "codex_mode": "cli",
     "gemini_mode": "cli",
+    "codex_cli_permission_mode": "full-host-unattended",
+    "gemini_cli_permission_mode": "full-host-unattended",
     "models": {
         "claude": "claude-sonnet-4-5",
         "codex": "gpt-5",
@@ -93,6 +95,8 @@ def _load_config() -> dict:
         "claude_mode",
         "codex_mode",
         "gemini_mode",
+        "codex_cli_permission_mode",
+        "gemini_cli_permission_mode",
         "models",
         "chains",
         "keys",
@@ -133,6 +137,38 @@ def _try_save_config(cfg: dict) -> tuple[bool, str]:
         return False, str(exc)
 
 
+CLI_PERMISSION_MODES = ("full-host-unattended", "sandboxed-auto")
+
+
+def _cli_permissions_payload(cfg: dict) -> dict:
+    return {
+        "codex": {
+            "mode": cfg.get("codex_mode", "api"),
+            "permission_mode": cfg.get("codex_cli_permission_mode", "full-host-unattended"),
+            "model": cfg["models"]["codex"],
+            "orchestrator_model": cfg["models"]["codex_orchestrator"],
+        },
+        "gemini": {
+            "mode": cfg.get("gemini_mode", "api"),
+            "permission_mode": cfg.get("gemini_cli_permission_mode", "full-host-unattended"),
+            "model": cfg["models"]["gemini"],
+        },
+    }
+
+
+def _set_cli_permission_mode(cfg: dict, agent: str, permission_mode: str) -> tuple[bool, str]:
+    if agent not in ("codex", "gemini"):
+        return False, "Only codex and gemini support runtime CLI permission mode changes."
+    if permission_mode not in CLI_PERMISSION_MODES:
+        return False, f"Permission mode must be one of: {', '.join(CLI_PERMISSION_MODES)}"
+    key = f"{agent}_cli_permission_mode"
+    cfg[key] = permission_mode
+    ok, err = _try_save_config(cfg)
+    if not ok:
+        return False, f"warning: updated in memory but could not persist config: {err}"
+    return True, f"{agent} permission mode set to {permission_mode}"
+
+
 def _parse_chain(raw: str, default: list[str]) -> list[str]:
     raw = raw.strip()
     if not raw:
@@ -142,6 +178,26 @@ def _parse_chain(raw: str, default: list[str]) -> list[str]:
         if part in AGENTS and part not in out:
             out.append(part)
     return out or list(default)
+
+
+def _agent_prompt_identity(agent: str) -> str:
+    if agent == "codex":
+        return "You are Codex, the implementation-heavy engineering agent."
+    if agent == "gemini":
+        return "You are Gemini, the UI/docs and second-opinion agent."
+    if agent == "claude":
+        return "You are Claude, the orchestrator/review agent."
+    return f"You are {agent.title()}, a pragmatic software assistant."
+
+
+def _default_role_for_direct_agent(agent: str) -> str:
+    if agent == "codex":
+        return "implementation"
+    if agent == "gemini":
+        return "uidocs"
+    if agent == "claude":
+        return "review"
+    return "orchestrator"
 
 
 def _key_for(agent: str, cfg: dict) -> str:
@@ -327,19 +383,23 @@ def _call_codex_api(prompt: str, cfg: dict, role: str) -> str:
     return out or "<empty response>"
 
 
-def _call_codex_cli(prompt: str, cfg: dict) -> str:
+def _codex_cli_model(cfg: dict, role: str) -> str:
+    return cfg["models"]["codex_orchestrator"] if role == "orchestrator" else cfg["models"]["codex"]
+
+
+def _call_codex_cli(prompt: str, cfg: dict, role: str) -> str:
     if shutil.which("codex") is None:
         raise RuntimeError("Codex CLI not found on PATH")
     cli_cwd = _cli_workdir(cfg)
     allowed = _allowed_dirs(cfg)
     with tempfile.NamedTemporaryFile(prefix="daniel-codex-", suffix=".txt", delete=False) as tmp:
         out_path = tmp.name
+    permission_mode = cfg.get("codex_cli_permission_mode", "full-host-unattended")
     cmd = [
         "codex",
         "exec",
-        "--full-auto",
-        "--sandbox",
-        "workspace-write",
+        "--model",
+        _codex_cli_model(cfg, role),
         "--cd",
         cli_cwd or str(Path.home()),
         "--skip-git-repo-check",
@@ -348,6 +408,10 @@ def _call_codex_cli(prompt: str, cfg: dict) -> str:
         "-o",
         out_path,
     ]
+    if permission_mode == "full-host-unattended":
+        cmd.append("--dangerously-bypass-approvals-and-sandbox")
+    else:
+        cmd.extend(["--full-auto", "--sandbox", "workspace-write"])
     for d in allowed:
         cmd.extend(["--add-dir", d])
     cmd.append(prompt)
@@ -356,6 +420,7 @@ def _call_codex_cli(prompt: str, cfg: dict) -> str:
         cwd=cli_cwd,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
         timeout=1800,
     )
     if proc.returncode != 0:
@@ -378,7 +443,7 @@ def _call_codex(prompt: str, cfg: dict, role: str) -> str:
     if mode == "api":
         return _call_codex_api(prompt, cfg, role)
     if mode == "cli":
-        return _call_codex_cli(prompt, cfg)
+        return _call_codex_cli(prompt, cfg, role)
     raise RuntimeError(f"Unsupported codex_mode: {mode}")
 
 
@@ -461,20 +526,26 @@ def _call_gemini_cli(prompt: str, cfg: dict) -> str:
     if shutil.which("gemini") is None:
         raise RuntimeError("Gemini CLI not found on PATH")
     cli_cwd = _cli_workdir(cfg)
+    permission_mode = cfg.get("gemini_cli_permission_mode", "full-host-unattended")
     # Pass prompt via -p flag (Gemini CLI headless mode)
-    # Use text output format for reliability — JSON parsing was fragile
+    # Force text output for reliability — JSON parsing was fragile.
     cmd = [
         "gemini",
         "-p", prompt,
         "--model", cfg["models"]["gemini"],
-        "--yolo",
+        "--output-format", "text",
     ]
+    if permission_mode == "full-host-unattended":
+        cmd.extend(["--approval-mode", "yolo", "--sandbox=false"])
+    else:
+        cmd.extend(["--approval-mode", "yolo"])
     try:
         proc = subprocess.run(
             cmd,
             cwd=cli_cwd,
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,
             timeout=GEMINI_CLI_TIMEOUT_SECS,
         )
     except subprocess.TimeoutExpired:
@@ -655,13 +726,26 @@ def _shared_context(tasks_root: Path, task_id: str | None, cfg: dict | None = No
     return "\n\n".join(sections)
 
 
-def _build_prompt(role: str, user_text: str, history: list[dict], shared: str, name: str = "agent") -> str:
+def _build_prompt(
+    role: str,
+    user_text: str,
+    history: list[dict],
+    shared: str,
+    name: str = "agent",
+    agent: str | None = None,
+    direct_address: bool = False,
+) -> str:
     hist = history[-8:]
     hist_text = "\n".join(f"{m['role']}: {m['text']}" for m in hist)
+    identity = _agent_prompt_identity(agent or name.lower())
+    direct_note = "This message was directly addressed to you, so answer as that specific agent.\n" if direct_address else ""
     return (
-        f"You are {name.title()}, a pragmatic software assistant.\n"
+        f"{identity}\n"
+        f"You are operating inside {name.title()}, a pragmatic multi-agent software assistant.\n"
         f"Current role: {role}.\n"
         "Use concise, actionable outputs.\n"
+        "Keep your answer in your own perspective and do not pretend to be a different agent.\n"
+        f"{direct_note}"
         "Respect guardrails and todo/context.\n\n"
         "SHARED CONTEXT:\n"
         f"{shared}\n\n"
@@ -682,6 +766,8 @@ def _render_response_block(agent: str, role: str, text: str) -> str:
 
 
 def _call_agent_with_spinner(agent: str, prompt: str, cfg: dict, role: str) -> str:
+    if not sys.stdout.isatty():
+        return _call_agent(agent, prompt, cfg, role)
     done = threading.Event()
 
     def _spin() -> None:
@@ -704,6 +790,41 @@ def _call_agent_with_spinner(agent: str, prompt: str, cfg: dict, role: str) -> s
     finally:
         done.set()
         t.join(timeout=1)
+
+
+def _route_message(raw: str) -> tuple[str, str, str | None]:
+    role = "orchestrator"
+    direct_agent: str | None = None
+    user_text = raw.strip()
+    if user_text.lower().startswith("impl:"):
+        return "implementation", user_text[5:].strip(), None
+    if user_text.lower().startswith("ui:"):
+        return "uidocs", user_text[3:].strip(), None
+    lowered = user_text.lower()
+    for agent_name in AGENTS:
+        prefix = f"@{agent_name} "
+        if lowered.startswith(prefix):
+            direct_agent = agent_name
+            user_text = user_text[len(prefix):].strip()
+            role = _default_role_for_direct_agent(agent_name)
+            break
+    return role, user_text, direct_agent
+
+
+def _run_once(cfg: dict, message: str, task_id: str | None) -> int:
+    history: list[dict] = []
+    role, user_text, direct_agent = _route_message(message)
+    history.append({"role": "user", "text": user_text})
+    try:
+        agent, out, failures = _chat_once(role, user_text, cfg, history, task_id, direct_agent=direct_agent)
+        sys.stdout.write(_render_response_block(agent, role, out))
+        if failures:
+            for f in failures:
+                sys.stdout.write(_c("33", f"  [fallback] {f}") + "\n")
+        return 0
+    except Exception as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 1
 
 
 def _smoke_test(cfg: dict, task_id: str | None) -> int:
@@ -784,10 +905,26 @@ def setup_wizard(cfg: dict, force: bool = False) -> dict:
     if codex_mode not in ("api", "cli"):
         codex_mode = "api"
     cfg["codex_mode"] = codex_mode
+    if cfg["codex_mode"] == "cli":
+        codex_perm = _prompt(
+            "Codex CLI permission mode (full-host-unattended/sandboxed-auto)",
+            cfg.get("codex_cli_permission_mode", "full-host-unattended"),
+        ).lower()
+        if codex_perm not in ("full-host-unattended", "sandboxed-auto"):
+            codex_perm = "full-host-unattended"
+        cfg["codex_cli_permission_mode"] = codex_perm
     gemini_mode = _prompt("Gemini mode (api/cli)", cfg.get("gemini_mode", "api")).lower()
     if gemini_mode not in ("api", "cli"):
         gemini_mode = "api"
     cfg["gemini_mode"] = gemini_mode
+    if cfg["gemini_mode"] == "cli":
+        gemini_perm = _prompt(
+            "Gemini CLI permission mode (full-host-unattended/sandboxed-auto)",
+            cfg.get("gemini_cli_permission_mode", "full-host-unattended"),
+        ).lower()
+        if gemini_perm not in ("full-host-unattended", "sandboxed-auto"):
+            gemini_perm = "full-host-unattended"
+        cfg["gemini_cli_permission_mode"] = gemini_perm
 
     existing_openai = cfg["keys"]["openai"] if cfg["keys"]["openai"] and not force else ""
     existing_anthropic = cfg["keys"]["anthropic"] if cfg["keys"]["anthropic"] and not force else ""
@@ -891,16 +1028,31 @@ def _run_orchestrator(task_id: str, cfg: dict) -> int:
     return proc.returncode
 
 
-def _chat_once(role: str, message: str, cfg: dict, history: list[dict], task_id: str | None) -> tuple[str, str, list[str]]:
-    chain = _role_chain(role, cfg)
+def _chat_once(
+    role: str,
+    message: str,
+    cfg: dict,
+    history: list[dict],
+    task_id: str | None,
+    direct_agent: str | None = None,
+) -> tuple[str, str, list[str]]:
+    chain = [direct_agent] if direct_agent else _role_chain(role, cfg)
     if not chain:
         raise RuntimeError("No available agents for this role. Add at least one API key in /setup.")
 
     shared = _shared_context(Path(cfg["tasks_root"]).expanduser(), task_id, cfg)
-    prompt = _build_prompt(role, message, history, shared, cfg.get("name", "agent"))
     failures: list[str] = []
     for agent in chain:
         try:
+            prompt = _build_prompt(
+                role,
+                message,
+                history,
+                shared,
+                cfg.get("name", "agent"),
+                agent=agent,
+                direct_address=direct_agent is not None,
+            )
             out = _call_agent_with_spinner(agent, prompt, cfg, role)
             return agent, out, failures
         except Exception as exc:
@@ -916,6 +1068,10 @@ def _print_help() -> None:
     print("  /help                 show help")
     print("  /setup                rerun setup wizard")
     print("  /models               show models")
+    print("  /modes                show CLI/API modes and permission modes")
+    print("  /modes set <agent> <full-host-unattended|sandboxed-auto>")
+    print("  /permissions          alias for /modes")
+    print("  /permissions set <agent> <full-host-unattended|sandboxed-auto>")
     print("  /chains               show role chains")
     print("  /task                 show current task")
     print("  /task list            list known tasks")
@@ -933,6 +1089,9 @@ def _print_help() -> None:
     print("  /quit                 exit")
     print("  impl: <msg>           force implementation role")
     print("  ui: <msg>             force ui/docs role")
+    print("  @claude <msg>         send directly to Claude")
+    print("  @codex <msg>          send directly to Codex")
+    print("  @gemini <msg>         send directly to Gemini")
 
 
 def run_chat(cfg: dict, initial_task: str | None) -> int:
@@ -969,6 +1128,18 @@ def run_chat(cfg: dict, initial_task: str | None) -> int:
                 "models": cfg["models"],
             }
             print(json.dumps(payload, indent=2))
+            continue
+        if raw in ("/modes", "/permissions"):
+            print(json.dumps(_cli_permissions_payload(cfg), indent=2))
+            continue
+        if raw.startswith("/modes set ") or raw.startswith("/permissions set "):
+            parts = raw.split()
+            if len(parts) != 4:
+                print("Usage: /permissions set <codex|gemini> <full-host-unattended|sandboxed-auto>")
+                continue
+            _, _, agent, permission_mode = parts
+            ok, msg = _set_cli_permission_mode(cfg, agent, permission_mode)
+            print(msg)
             continue
         if raw == "/chains":
             print(json.dumps(cfg["chains"], indent=2))
@@ -1142,18 +1313,11 @@ def run_chat(cfg: dict, initial_task: str | None) -> int:
             print(f"orchestrator exit code: {rc}")
             continue
 
-        role = "orchestrator"
-        user_text = raw
-        if raw.lower().startswith("impl:"):
-            role = "implementation"
-            user_text = raw[5:].strip()
-        elif raw.lower().startswith("ui:"):
-            role = "uidocs"
-            user_text = raw[3:].strip()
+        role, user_text, direct_agent = _route_message(raw)
 
         history.append({"role": "user", "text": user_text})
         try:
-            agent, out, failures = _chat_once(role, user_text, cfg, history, task_id)
+            agent, out, failures = _chat_once(role, user_text, cfg, history, task_id, direct_agent=direct_agent)
             print(_render_response_block(agent, role, out))
             if failures:
                 for f in failures:
@@ -1169,6 +1333,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Multi-agent terminal orchestrator")
     parser.add_argument("--setup", action="store_true", help="run setup wizard and exit")
     parser.add_argument("--task", default="", help="initial task id")
+    parser.add_argument("--prompt", default="", help="run a single prompt non-interactively and exit")
     args = parser.parse_args()
 
     cfg = _load_config()
@@ -1180,6 +1345,9 @@ def main() -> int:
             return 1
         if args.setup:
             return 0
+
+    if args.prompt:
+        return _run_once(cfg, args.prompt, args.task or None)
 
     return run_chat(cfg, args.task or None)
 
