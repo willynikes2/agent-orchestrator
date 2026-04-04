@@ -662,7 +662,7 @@ def _cli_workdir(cfg: dict) -> str | None:
 def _kb_search(query: str, cfg: dict, limit: int = 5) -> str:
     """Search the knowledge base server if running. Returns empty string if KB unavailable."""
     port = cfg.get("kb_port", "3838")
-    url = f"http://localhost:{port}/api/v1/search?q={urllib.parse.quote(query)}&limit={limit}"
+    url = f"http://localhost:{port}/api/v1/search/smart?q={urllib.parse.quote(query)}&limit={limit}"
     try:
         headers = {"Accept": "application/json"}
         # Use API key if configured
