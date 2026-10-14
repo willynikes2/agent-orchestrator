@@ -995,8 +995,8 @@ def _call_grok(prompt: str, cfg: dict) -> str:
 def _antigravity_cli_command(prompt: str, model: str, permission_mode: str, timeout: int) -> list[str]:
     cmd = [
         "agy",
-        "--print",
-        prompt,
+        # Attached with '=', so a prompt that looks like a flag can never be parsed as one.
+        f"--print={prompt}",
         "--output-format",
         "json",
         "--print-timeout",

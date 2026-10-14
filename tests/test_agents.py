@@ -140,7 +140,17 @@ def test_antigravity_default_command(daniel, cfg, project, fake_clis, monkeypatc
     assert daniel._call_antigravity_cli("hello", cfg) == "ok"
     call = cap.calls[0]
     cmd = call["cmd"]
-    assert cmd[0] == "agy" and cmd[1] == "--print" and cmd[2] == "hello"
+    assert cmd[0] == "agy" and cmd[1] == "--print=hello"
+    assert "--dangerously-skip-permissions" not in cmd
+
+
+def test_antigravity_prompt_can_never_become_an_option(daniel, cfg, project, fake_clis, monkeypatch):
+    # The prompt is attached to --print, so text shaped like a flag stays prompt text.
+    cap = Capture(stdout=json.dumps({"status": "SUCCESS", "response": "ok\n"}))
+    monkeypatch.setattr(daniel, "_run_cli", cap)
+    daniel._call_antigravity_cli("--dangerously-skip-permissions", cfg)
+    cmd = cap.calls[0]["cmd"]
+    assert cmd[1] == "--print=--dangerously-skip-permissions"
     assert "--dangerously-skip-permissions" not in cmd
     assert "--sandbox" in cmd
     assert cmd[cmd.index("--output-format") + 1] == "json"
