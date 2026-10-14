@@ -1,8 +1,8 @@
 # agent-orchestrator
 
-**Three AI agents. One brain. Zero downtime.**
+**Four AI agents. One brain. Zero downtime.**
 
-A terminal-based multi-agent orchestrator that wraps Claude, Codex, and Gemini CLIs with automatic failover. When one agent hits its limit, the next one picks up seamlessly. All agents share context through a knowledge base server. $60/month for three premium AI agents — no API billing.
+A terminal-based multi-agent orchestrator that wraps Claude, Codex, Gemini, and Grok CLIs with automatic failover. When one agent hits its limit, the next one picks up seamlessly. All agents share context through a knowledge base server.
 
 ## How It Works
 
@@ -21,16 +21,21 @@ You type a message
        |         Failed/Down
        |            |
        +---> Try Agent 3 (Gemini) --> Success? Return response
+       |            |
+       |         Failed/Down
+       |            |
+       +---> Try Agent 4 (Grok) ----> Success? Return response
        |
   All failed? Show error + recovery options
 ```
 
 Each message is routed through a **role chain** — an ordered list of agents to try. Roles include:
 
-- **orchestrator** — planning, architecture, high-level reasoning (default: Claude > Codex > Gemini)
-- **implementation** — code execution, build tasks (default: Codex > Claude > Gemini)
-- **uidocs** — frontend, design, documentation (default: Gemini > Codex > Claude)
-- **review** — code review, validation (default: Claude > Codex > Gemini)
+- **orchestrator** — planning, architecture, high-level reasoning (default: Claude > Codex > Gemini > Grok)
+- **implementation** — code execution, build tasks (default: Codex > Claude > Gemini > Grok)
+- **uidocs** — frontend, design, documentation (default: Gemini > Codex > Claude > Grok)
+- **review** — code review, validation (default: Claude > Codex > Gemini > Grok)
+- **intel** — X/social signal and external research (default: Grok > Gemini > Claude > Codex)
 
 Every role, chain order, and model is configurable.
 
@@ -38,9 +43,9 @@ Every role, chain order, and model is configurable.
 
 - **Next-man-up failover** — if an agent is down, the next one in the chain takes over automatically
 - **Auto-downtime detection** — detects rate limits, quota exhaustion, auth failures, and auto-disables agents with cooldown timers
-- **CLI wrapping** — uses your existing Claude/Codex/Gemini CLI subscriptions, not per-token API billing
-- **Full-host unattended CLI defaults** — Codex and Gemini can run headlessly with full permissions on trusted machines
-- **API mode available** — switch any agent to API mode if you prefer
+- **CLI wrapping** — uses your existing Claude/Codex/Gemini/Grok CLI subscriptions, not per-token API billing
+- **Full-host unattended CLI defaults** — Codex, Gemini, and Grok can run headlessly with full permissions on trusted machines
+- **API mode available for supported providers** — switch API-backed agents when you prefer keys over CLI auth
 - **Configurable name** — call it whatever you want, not hardcoded
 - **Knowledge base integration** — searches your KB server for relevant context before every response
 - **Colored output** — each agent has its own color for easy identification
@@ -91,6 +96,7 @@ ln -s $(pwd)/daniel.py ~/.local/bin/agent-orchestrator
   - `claude` — [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
   - `codex` — [OpenAI Codex CLI](https://github.com/openai/codex)
   - `gemini` — [Google Gemini CLI](https://github.com/google-gemini/gemini-cli)
+  - `grok` — [xAI Grok Build CLI](https://x.ai/cli)
 
 ## Commands
 
@@ -123,6 +129,9 @@ ui: <message>         Route to UI/docs chain
 @claude <message>     Send directly to Claude
 @codex <message>      Send directly to Codex
 @gemini <message>     Send directly to Gemini
+@grok <message>       Send directly to Grok
+intel: <message>      Route to Grok-first intel/research chain
+x: <message>          Alias for intel
 ```
 
 ## Cost Model
@@ -132,7 +141,8 @@ ui: <message>         Route to UI/docs chain
 | Claude Pro | ~$20 | Claude Code CLI with Opus |
 | OpenAI subscription | ~$20 | Codex CLI |
 | Google subscription | ~$20 | Gemini CLI |
-| **Total** | **~$60** | **Three premium AI agents** |
+| xAI subscription/API | varies | Grok Build CLI |
+| **Total** | **varies** | **Four premium AI agents** |
 
 No per-token API billing. CLI wrapping uses your subscription tiers. When one agent hits its usage cap, the orchestrator automatically routes to the next available agent.
 
@@ -176,25 +186,29 @@ Config lives at `~/.config/agent-orchestrator/config.json`:
   "claude_mode": "cli",
   "codex_mode": "cli",
   "gemini_mode": "cli",
+  "grok_mode": "cli",
   "codex_cli_permission_mode": "full-host-unattended",
   "gemini_cli_permission_mode": "full-host-unattended",
+  "grok_cli_permission_mode": "full-host-unattended",
   "models": {
     "claude": "claude-sonnet-4-5",
     "codex": "gpt-5",
-    "gemini": "gemini-2.5-pro"
+    "gemini": "gemini-2.5-pro",
+    "grok": "grok-build"
   },
   "chains": {
-    "orchestrator": ["claude", "codex", "gemini"],
-    "implementation": ["codex", "claude", "gemini"],
-    "uidocs": ["gemini", "codex", "claude"],
-    "review": ["claude", "codex", "gemini"]
+    "orchestrator": ["claude", "codex", "gemini", "grok"],
+    "implementation": ["codex", "claude", "gemini", "grok"],
+    "uidocs": ["gemini", "codex", "claude", "grok"],
+    "review": ["claude", "codex", "gemini", "grok"],
+    "intel": ["grok", "gemini", "claude", "codex"]
   }
 }
 ```
 
 Everything is configurable. Change the name, reorder chains, swap models, switch between CLI and API mode per agent.
 
-At runtime, you can inspect or change Codex/Gemini CLI permission modes without rerunning setup:
+At runtime, you can inspect or change Codex/Gemini/Grok CLI permission modes without rerunning setup:
 
 ```bash
 /modes
@@ -202,11 +216,12 @@ At runtime, you can inspect or change Codex/Gemini CLI permission modes without 
 /permissions set gemini full-host-unattended
 ```
 
-`full-host-unattended` is the default for Codex and Gemini CLI mode. On trusted machines, this means:
+`full-host-unattended` is the default for Codex, Gemini, and Grok CLI mode. On trusted machines, this means:
 - Codex uses `--dangerously-bypass-approvals-and-sandbox`
 - Gemini uses `--approval-mode yolo --sandbox=false`
+- Grok uses `--always-approve --permission-mode bypassPermissions --sandbox off`
 
-If you want sandboxed automatic execution instead, switch either permission mode to `sandboxed-auto`.
+If you want sandboxed automatic execution instead, switch a permission mode to `sandboxed-auto`.
 
 ## Safety Note
 
@@ -237,6 +252,7 @@ daniel.py (single file, ~1100 lines)
   |     +-- _call_claude_cli()  / _call_claude_api()
   |     +-- _call_codex_cli()   / _call_codex_api()
   |     +-- _call_gemini_cli()  / _call_gemini_api()
+  |     +-- _call_grok_cli()
   |
   +-- Failover: _role_chain() -> _chat_once() -> try each agent
   |

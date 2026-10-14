@@ -19,8 +19,10 @@ from getpass import getpass
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-AGENTS = ("claude", "codex", "gemini")
+AGENTS = ("claude", "codex", "gemini", "grok")
 GEMINI_CLI_TIMEOUT_SECS = 300  # 5 minutes (was 120 — too short for complex prompts)
+GROK_CLI_TIMEOUT_SECS = 1800
+GEMINI_KNOWN_MODELS = ("gemini-2.5-pro", "gemini-2.5-flash")
 DEFAULTS = {
     "name": "agent",
     "tasks_root": str(Path.home() / "tasks"),
@@ -28,29 +30,35 @@ DEFAULTS = {
     "claude_mode": "cli",
     "codex_mode": "cli",
     "gemini_mode": "cli",
+    "grok_mode": "cli",
     "codex_cli_permission_mode": "full-host-unattended",
     "gemini_cli_permission_mode": "full-host-unattended",
+    "grok_cli_permission_mode": "full-host-unattended",
     "models": {
         "claude": "claude-sonnet-4-5",
         "codex": "gpt-5",
         "codex_orchestrator": "gpt-5",
         "gemini": "gemini-2.5-pro",
+        "grok": "grok-build",
     },
     "chains": {
-        "orchestrator": ["claude", "codex", "gemini"],
-        "implementation": ["codex", "claude", "gemini"],
-        "uidocs": ["gemini", "codex", "claude"],
-        "review": ["claude", "codex", "gemini"],
+        "orchestrator": ["claude", "codex", "gemini", "grok"],
+        "implementation": ["codex", "claude", "gemini", "grok"],
+        "uidocs": ["gemini", "codex", "claude", "grok"],
+        "review": ["claude", "codex", "gemini", "grok"],
+        "intel": ["grok", "gemini", "claude", "codex"],
     },
     "keys": {
         "openai": "",
         "anthropic": "",
         "gemini": "",
+        "xai": "",
     },
     "service_overrides": {
         "claude": {"manual_disabled": False, "disabled_until": ""},
         "codex": {"manual_disabled": False, "disabled_until": ""},
         "gemini": {"manual_disabled": False, "disabled_until": ""},
+        "grok": {"manual_disabled": False, "disabled_until": ""},
     },
     "allowed_dirs": [str(Path.home())],
 }
@@ -65,7 +73,7 @@ _COLORS = sys.stdout.isatty()
 def _c(code: str, text: str) -> str:
     return f"\033[{code}m{text}\033[0m" if _COLORS else text
 
-AGENT_COLORS = {"claude": "35", "codex": "32", "gemini": "34"}  # magenta, green, blue
+AGENT_COLORS = {"claude": "35", "codex": "32", "gemini": "34", "grok": "36"}  # magenta, green, blue, cyan
 
 
 def _read(path: Path) -> str:
@@ -95,8 +103,10 @@ def _load_config() -> dict:
         "claude_mode",
         "codex_mode",
         "gemini_mode",
+        "grok_mode",
         "codex_cli_permission_mode",
         "gemini_cli_permission_mode",
+        "grok_cli_permission_mode",
         "models",
         "chains",
         "keys",
@@ -153,12 +163,17 @@ def _cli_permissions_payload(cfg: dict) -> dict:
             "permission_mode": cfg.get("gemini_cli_permission_mode", "full-host-unattended"),
             "model": cfg["models"]["gemini"],
         },
+        "grok": {
+            "mode": cfg.get("grok_mode", "cli"),
+            "permission_mode": cfg.get("grok_cli_permission_mode", "full-host-unattended"),
+            "model": cfg["models"]["grok"],
+        },
     }
 
 
 def _set_cli_permission_mode(cfg: dict, agent: str, permission_mode: str) -> tuple[bool, str]:
-    if agent not in ("codex", "gemini"):
-        return False, "Only codex and gemini support runtime CLI permission mode changes."
+    if agent not in ("codex", "gemini", "grok"):
+        return False, "Only codex, gemini, and grok support runtime CLI permission mode changes."
     if permission_mode not in CLI_PERMISSION_MODES:
         return False, f"Permission mode must be one of: {', '.join(CLI_PERMISSION_MODES)}"
     key = f"{agent}_cli_permission_mode"
@@ -187,6 +202,8 @@ def _agent_prompt_identity(agent: str) -> str:
         return "You are Gemini, the UI/docs and second-opinion agent."
     if agent == "claude":
         return "You are Claude, the orchestrator/review agent."
+    if agent == "grok":
+        return "You are Grok, the X/Twitter intelligence and external-signal analysis agent."
     return f"You are {agent.title()}, a pragmatic software assistant."
 
 
@@ -197,6 +214,8 @@ def _default_role_for_direct_agent(agent: str) -> str:
         return "uidocs"
     if agent == "claude":
         return "review"
+    if agent == "grok":
+        return "intel"
     return "orchestrator"
 
 
@@ -205,8 +224,17 @@ def _key_for(agent: str, cfg: dict) -> str:
         "codex": cfg["keys"]["openai"] if cfg.get("codex_mode", "api") == "api" else "cli",
         "claude": cfg["keys"]["anthropic"] if cfg.get("claude_mode", "cli") == "api" else "cli",
         "gemini": cfg["keys"]["gemini"] if cfg.get("gemini_mode", "api") == "api" else "cli",
+        "grok": cfg["keys"]["xai"] if cfg.get("grok_mode", "cli") == "api" else "cli",
     }
     return mapping[agent].strip()
+
+
+def _grok_auth_configured(cfg: dict) -> bool:
+    return bool(
+        str(cfg.get("keys", {}).get("xai", "")).strip()
+        or os.environ.get("XAI_API_KEY", "").strip()
+        or (Path.home() / ".grok" / "auth.json").exists()
+    )
 
 
 def _available(agent: str, cfg: dict) -> bool:
@@ -230,6 +258,11 @@ def _available(agent: str, cfg: dict) -> bool:
             return bool(cfg["keys"]["gemini"].strip())
         if mode == "cli":
             return shutil.which("gemini") is not None
+        return False
+    if agent == "grok":
+        mode = cfg.get("grok_mode", "cli")
+        if mode == "cli":
+            return shutil.which("grok") is not None and _grok_auth_configured(cfg)
         return False
     return bool(_key_for(agent, cfg))
 
@@ -268,6 +301,8 @@ def _service_disabled_reason(agent: str, cfg: dict, now: datetime | None = None)
 
 
 def _service_status(agent: str, cfg: dict) -> str:
+    if agent == "grok" and shutil.which("grok") is not None and not _grok_auth_configured(cfg):
+        return "unavailable (missing auth: run `grok login --device-auth` or set XAI_API_KEY)"
     if not _available(agent, cfg):
         return "unavailable (missing key/cli)"
     reason = _service_disabled_reason(agent, cfg)
@@ -340,6 +375,26 @@ def _apply_auto_downtime(agent: str, error_text: str, cfg: dict) -> str | None:
             ok, err = _try_save_config(cfg)
             suffix = "" if ok else f" (warning: could not persist config: {err})"
             return f"auto-down: {agent} auth failed. Check API key then /service up {agent}.{suffix}"
+
+    if agent == "grok":
+        lower = text.lower()
+        if "rate limit" in lower or "429" in lower or "resource exhausted" in lower or "quota" in lower:
+            override["disabled_until"] = _format_iso_utc(datetime.now(timezone.utc) + timedelta(minutes=5))
+            ok, err = _try_save_config(cfg)
+            suffix = "" if ok else f" (warning: could not persist config: {err})"
+            return f"auto-down: {agent} rate limited, retry in 5min{suffix}"
+        if (
+            "not authenticated" in lower
+            or "unauthorized" in lower
+            or "401" in lower
+            or "xai_api_key" in lower
+            or "authentication" in lower
+        ):
+            override["manual_disabled"] = True
+            override["disabled_until"] = ""
+            ok, err = _try_save_config(cfg)
+            suffix = "" if ok else f" (warning: could not persist config: {err})"
+            return f"auto-down: {agent} auth failed. Run `grok login --device-auth` or set XAI_API_KEY, then /service up {agent}.{suffix}"
 
     return None
 
@@ -515,11 +570,23 @@ def _call_gemini_api(prompt: str, cfg: dict) -> str:
     from google import genai  # type: ignore
 
     client = genai.Client(api_key=cfg["keys"]["gemini"])
-    resp = client.models.generate_content(model=cfg["models"]["gemini"], contents=prompt)
-    text = getattr(resp, "text", None)
-    if isinstance(text, str) and text.strip():
-        return text.strip()
-    return str(resp)
+    last_error: Exception | None = None
+    for model in _gemini_model_candidates(cfg):
+        try:
+            resp = client.models.generate_content(model=model, contents=prompt)
+        except Exception as exc:
+            if not _is_gemini_model_not_found_error(str(exc)):
+                raise
+            last_error = exc
+            continue
+        _persist_gemini_model_recovery(cfg, model)
+        text = getattr(resp, "text", None)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        return str(resp)
+    if last_error is not None:
+        raise RuntimeError(str(last_error))
+    raise RuntimeError("gemini API failed without returning output")
 
 
 def _call_gemini_cli(prompt: str, cfg: dict) -> str:
@@ -527,59 +594,96 @@ def _call_gemini_cli(prompt: str, cfg: dict) -> str:
         raise RuntimeError("Gemini CLI not found on PATH")
     cli_cwd = _cli_workdir(cfg)
     permission_mode = cfg.get("gemini_cli_permission_mode", "full-host-unattended")
-    # Pass prompt via -p flag (Gemini CLI headless mode)
-    # Force text output for reliability — JSON parsing was fragile.
-    cmd = [
-        "gemini",
-        "-p", prompt,
-        "--model", cfg["models"]["gemini"],
-        "--output-format", "text",
-    ]
-    if permission_mode == "full-host-unattended":
-        cmd.extend(["--approval-mode", "yolo", "--sandbox=false"])
-    else:
-        cmd.extend(["--approval-mode", "yolo"])
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=cli_cwd,
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            timeout=GEMINI_CLI_TIMEOUT_SECS,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"gemini CLI timed out after {GEMINI_CLI_TIMEOUT_SECS}s")
-    if proc.returncode != 0:
-        err = (proc.stderr or "").strip() or (proc.stdout or "").strip() or f"exit {proc.returncode}"
-        raise RuntimeError(f"gemini CLI failed: {err}")
-    raw = (proc.stdout or "").strip()
-    if not raw:
-        # Check stderr for clues
-        stderr = (proc.stderr or "").strip()
-        if stderr:
-            raise RuntimeError(f"gemini CLI empty output, stderr: {stderr}")
-        return "<empty response>"
-    # Try to extract text from JSON if Gemini returns structured output
-    try:
-        parsed = json.loads(raw)
-        # Gemini CLI JSON format: candidates[0].content.parts[0].text
-        if isinstance(parsed, dict):
-            candidates = parsed.get("candidates", [])
-            if candidates and isinstance(candidates, list):
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if parts and isinstance(parts, list):
-                    text = parts[0].get("text", "")
-                    if text.strip():
-                        return text.strip()
-            # Fallback: try flat keys
-            for key in ("text", "content", "response"):
-                val = parsed.get(key)
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-    except (json.JSONDecodeError, IndexError, KeyError, TypeError):
-        pass
-    return raw
+    last_error: str | None = None
+    for model in _gemini_model_candidates(cfg):
+        # Pass prompt via -p flag (Gemini CLI headless mode)
+        # Force text output for reliability — JSON parsing was fragile.
+        cmd = [
+            "gemini",
+            "-p", prompt,
+            "--model", model,
+            "--output-format", "text",
+        ]
+        if permission_mode == "full-host-unattended":
+            cmd.extend(["--approval-mode", "yolo", "--sandbox=false"])
+        else:
+            cmd.extend(["--approval-mode", "yolo"])
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=cli_cwd,
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=GEMINI_CLI_TIMEOUT_SECS,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"gemini CLI timed out after {GEMINI_CLI_TIMEOUT_SECS}s")
+        if proc.returncode != 0:
+            err = (proc.stderr or "").strip() or (proc.stdout or "").strip() or f"exit {proc.returncode}"
+            if _is_gemini_model_not_found_error(err):
+                last_error = err
+                continue
+            raise RuntimeError(f"gemini CLI failed: {err}")
+        raw = (proc.stdout or "").strip()
+        if not raw:
+            # Check stderr for clues
+            stderr = (proc.stderr or "").strip()
+            if stderr:
+                raise RuntimeError(f"gemini CLI empty output, stderr: {stderr}")
+            _persist_gemini_model_recovery(cfg, model)
+            return "<empty response>"
+        _persist_gemini_model_recovery(cfg, model)
+        # Try to extract text from JSON if Gemini returns structured output
+        try:
+            parsed = json.loads(raw)
+            # Gemini CLI JSON format: candidates[0].content.parts[0].text
+            if isinstance(parsed, dict):
+                candidates = parsed.get("candidates", [])
+                if candidates and isinstance(candidates, list):
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts and isinstance(parts, list):
+                        text = parts[0].get("text", "")
+                        if text.strip():
+                            return text.strip()
+                # Fallback: try flat keys
+                for key in ("text", "content", "response"):
+                    val = parsed.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+            pass
+        return raw
+    if last_error is not None:
+        raise RuntimeError(f"gemini CLI failed: {last_error}")
+    raise RuntimeError("gemini CLI failed without returning output")
+
+
+def _is_gemini_model_not_found_error(text: str) -> bool:
+    lower = (text or "").lower()
+    return (
+        "modelnot found" in lower
+        or "requested entity was not found" in lower
+        or "model not found" in lower
+    )
+
+
+def _gemini_model_candidates(cfg: dict) -> list[str]:
+    candidates: list[str] = []
+    configured = str(cfg.get("models", {}).get("gemini", "")).strip()
+    for model in (configured, DEFAULTS["models"]["gemini"], *GEMINI_KNOWN_MODELS):
+        cleaned = str(model or "").strip()
+        if cleaned and cleaned not in candidates:
+            candidates.append(cleaned)
+    return candidates
+
+
+def _persist_gemini_model_recovery(cfg: dict, model: str) -> None:
+    cleaned = str(model or "").strip()
+    if not cleaned or cfg["models"].get("gemini") == cleaned:
+        return
+    cfg["models"]["gemini"] = cleaned
+    _try_save_config(cfg)
 
 
 def _call_gemini(prompt: str, cfg: dict) -> str:
@@ -591,6 +695,83 @@ def _call_gemini(prompt: str, cfg: dict) -> str:
     raise RuntimeError(f"Unsupported gemini_mode: {mode}")
 
 
+def _call_grok_cli(prompt: str, cfg: dict) -> str:
+    if shutil.which("grok") is None:
+        raise RuntimeError("Grok CLI not found on PATH")
+    if not _grok_auth_configured(cfg):
+        raise RuntimeError("Grok CLI not authenticated. Run `grok login --device-auth` or set XAI_API_KEY.")
+    cli_cwd = _cli_workdir(cfg) or str(Path.home())
+    model = str(cfg.get("models", {}).get("grok", "grok-build")).strip() or "grok-build"
+    with tempfile.NamedTemporaryFile(prefix="daniel-grok-", suffix=".txt", mode="w", encoding="utf-8", delete=False) as tmp:
+        tmp.write(prompt)
+        prompt_path = tmp.name
+    permission_mode = cfg.get("grok_cli_permission_mode", "full-host-unattended")
+    cmd = [
+        "grok",
+        "--prompt-file",
+        prompt_path,
+        "--cwd",
+        cli_cwd,
+        "--model",
+        model,
+        "--output-format",
+        "json",
+        "--no-plan",
+    ]
+    if permission_mode == "full-host-unattended":
+        cmd.extend(["--always-approve", "--permission-mode", "bypassPermissions", "--sandbox", "off"])
+    else:
+        cmd.extend(["--always-approve", "--sandbox", "workspace"])
+    env = os.environ.copy()
+    xai_key = str(cfg.get("keys", {}).get("xai", "")).strip()
+    if xai_key and not env.get("XAI_API_KEY"):
+        env["XAI_API_KEY"] = xai_key
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cli_cwd,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=GROK_CLI_TIMEOUT_SECS,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"grok CLI timed out after {GROK_CLI_TIMEOUT_SECS}s")
+    finally:
+        try:
+            os.remove(prompt_path)
+        except OSError:
+            pass
+    raw_stdout = (proc.stdout or "").strip()
+    raw_stderr = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        err = raw_stderr or raw_stdout or f"exit {proc.returncode}"
+        raise RuntimeError(f"grok CLI failed: {err}")
+    if not raw_stdout:
+        if raw_stderr:
+            raise RuntimeError(f"grok CLI empty output, stderr: {raw_stderr}")
+        return "<empty response>"
+    try:
+        parsed = json.loads(raw_stdout)
+    except json.JSONDecodeError:
+        return raw_stdout
+    if isinstance(parsed, dict):
+        if parsed.get("type") == "error":
+            raise RuntimeError(f"grok CLI failed: {parsed.get('message', raw_stdout)}")
+        text = parsed.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return raw_stdout
+
+
+def _call_grok(prompt: str, cfg: dict) -> str:
+    mode = cfg.get("grok_mode", "cli")
+    if mode == "cli":
+        return _call_grok_cli(prompt, cfg)
+    raise RuntimeError(f"Unsupported grok_mode: {mode}")
+
+
 def _call_agent(agent: str, prompt: str, cfg: dict, role: str) -> str:
     if agent == "codex":
         return _call_codex(prompt, cfg, role)
@@ -598,6 +779,8 @@ def _call_agent(agent: str, prompt: str, cfg: dict, role: str) -> str:
         return _call_claude(prompt, cfg)
     if agent == "gemini":
         return _call_gemini(prompt, cfg)
+    if agent == "grok":
+        return _call_grok(prompt, cfg)
     raise RuntimeError(f"Unknown agent: {agent}")
 
 
@@ -800,6 +983,10 @@ def _route_message(raw: str) -> tuple[str, str, str | None]:
         return "implementation", user_text[5:].strip(), None
     if user_text.lower().startswith("ui:"):
         return "uidocs", user_text[3:].strip(), None
+    if user_text.lower().startswith("intel:"):
+        return "intel", user_text[6:].strip(), None
+    if user_text.lower().startswith("x:"):
+        return "intel", user_text[2:].strip(), None
     lowered = user_text.lower()
     for agent_name in AGENTS:
         prefix = f"@{agent_name} "
@@ -859,16 +1046,19 @@ def _write_tasks_env(cfg: dict) -> None:
         f"OPENAI_API_KEY={cfg['keys']['openai']}",
         f"ANTHROPIC_API_KEY={cfg['keys']['anthropic']}",
         f"GEMINI_API_KEY={cfg['keys']['gemini']}",
+        f"XAI_API_KEY={cfg['keys'].get('xai', '')}",
         "",
         f"OPENAI_MODEL_CODEX={cfg['models']['codex']}",
         f"OPENAI_MODEL_ORCHESTRATOR_FALLBACK={cfg['models']['codex_orchestrator']}",
         f"ANTHROPIC_MODEL_ORCHESTRATOR={cfg['models']['claude']}",
         f"GEMINI_MODEL_UI_DOCS={cfg['models']['gemini']}",
+        f"GROK_MODEL_INTEL={cfg['models'].get('grok', 'grok-build')}",
         "",
         f"ORCHESTRATOR_CHAIN={','.join(cfg['chains']['orchestrator'])}",
         f"IMPLEMENTATION_CHAIN={','.join(cfg['chains']['implementation'])}",
         f"UIDOCS_CHAIN={','.join(cfg['chains']['uidocs'])}",
         f"REVIEW_CHAIN={','.join(cfg['chains']['review'])}",
+        f"INTEL_CHAIN={','.join(cfg['chains'].get('intel', DEFAULTS['chains']['intel']))}",
         "SHARED_CONTEXT_MAX_SECTION_CHARS=6000",
     ]
     _write(env_path, "\n".join(lines) + "\n")
@@ -925,10 +1115,22 @@ def setup_wizard(cfg: dict, force: bool = False) -> dict:
         if gemini_perm not in ("full-host-unattended", "sandboxed-auto"):
             gemini_perm = "full-host-unattended"
         cfg["gemini_cli_permission_mode"] = gemini_perm
+    grok_mode = _prompt("Grok mode (cli)", cfg.get("grok_mode", "cli")).lower()
+    if grok_mode != "cli":
+        grok_mode = "cli"
+    cfg["grok_mode"] = grok_mode
+    grok_perm = _prompt(
+        "Grok CLI permission mode (full-host-unattended/sandboxed-auto)",
+        cfg.get("grok_cli_permission_mode", "full-host-unattended"),
+    ).lower()
+    if grok_perm not in ("full-host-unattended", "sandboxed-auto"):
+        grok_perm = "full-host-unattended"
+    cfg["grok_cli_permission_mode"] = grok_perm
 
     existing_openai = cfg["keys"]["openai"] if cfg["keys"]["openai"] and not force else ""
     existing_anthropic = cfg["keys"]["anthropic"] if cfg["keys"]["anthropic"] and not force else ""
     existing_gemini = cfg["keys"]["gemini"] if cfg["keys"]["gemini"] and not force else ""
+    existing_xai = cfg["keys"].get("xai", "") if cfg["keys"].get("xai", "") and not force else ""
 
     oai_label = "OpenAI API key"
     if cfg["codex_mode"] == "cli":
@@ -942,10 +1144,15 @@ def setup_wizard(cfg: dict, force: bool = False) -> dict:
     if cfg["gemini_mode"] == "cli":
         gem_label += " (optional in cli mode)"
     gem = getpass(f"{gem_label}{' [press Enter to keep existing]' if existing_gemini else ''}: ").strip()
+    xai = getpass(
+        f"xAI API key (optional; Grok CLI can also use `grok login`)"
+        f"{' [press Enter to keep existing]' if existing_xai else ''}: "
+    ).strip()
 
     cfg["keys"]["openai"] = oai or existing_openai
     cfg["keys"]["anthropic"] = ant or existing_anthropic
     cfg["keys"]["gemini"] = gem or existing_gemini
+    cfg["keys"]["xai"] = xai or existing_xai
 
     has_provider = any(v.strip() for v in cfg["keys"].values())
     if cfg["claude_mode"] == "cli" and shutil.which("claude"):
@@ -954,9 +1161,11 @@ def setup_wizard(cfg: dict, force: bool = False) -> dict:
         has_provider = True
     if cfg["gemini_mode"] == "cli" and shutil.which("gemini"):
         has_provider = True
+    if cfg["grok_mode"] == "cli" and shutil.which("grok"):
+        has_provider = True
     if not has_provider:
         raise RuntimeError(
-            "No usable provider configured. Add at least one API key, or use Claude/Codex/Gemini in cli mode with their CLIs installed."
+            "No usable provider configured. Add at least one API key, or use Claude/Codex/Gemini/Grok in cli mode with their CLIs installed."
         )
 
     print("\nModel IDs (use exact account IDs if custom):")
@@ -966,8 +1175,9 @@ def setup_wizard(cfg: dict, force: bool = False) -> dict:
         "Codex fallback orchestrator model", cfg["models"]["codex_orchestrator"]
     )
     cfg["models"]["gemini"] = _prompt("Gemini model", cfg["models"]["gemini"])
+    cfg["models"]["grok"] = _prompt("Grok model", cfg["models"].get("grok", "grok-build"))
 
-    print("\nRole fallback chains (comma separated, values: claude,codex,gemini):")
+    print("\nRole fallback chains (comma separated, values: claude,codex,gemini,grok):")
     cfg["chains"]["orchestrator"] = _parse_chain(
         _prompt("ORCHESTRATOR_CHAIN", ",".join(cfg["chains"]["orchestrator"])),
         DEFAULTS["chains"]["orchestrator"],
@@ -983,6 +1193,10 @@ def setup_wizard(cfg: dict, force: bool = False) -> dict:
     cfg["chains"]["review"] = _parse_chain(
         _prompt("REVIEW_CHAIN", ",".join(cfg["chains"]["review"])),
         DEFAULTS["chains"]["review"],
+    )
+    cfg["chains"]["intel"] = _parse_chain(
+        _prompt("INTEL_CHAIN", ",".join(cfg["chains"].get("intel", DEFAULTS["chains"]["intel"]))),
+        DEFAULTS["chains"]["intel"],
     )
 
     _save_config(cfg)
@@ -1003,14 +1217,17 @@ def _run_orchestrator(task_id: str, cfg: dict) -> int:
     env["OPENAI_API_KEY"] = cfg["keys"]["openai"]
     env["ANTHROPIC_API_KEY"] = cfg["keys"]["anthropic"]
     env["GEMINI_API_KEY"] = cfg["keys"]["gemini"]
+    env["XAI_API_KEY"] = cfg["keys"].get("xai", "")
     env["OPENAI_MODEL_CODEX"] = cfg["models"]["codex"]
     env["OPENAI_MODEL_ORCHESTRATOR_FALLBACK"] = cfg["models"]["codex_orchestrator"]
     env["ANTHROPIC_MODEL_ORCHESTRATOR"] = cfg["models"]["claude"]
     env["GEMINI_MODEL_UI_DOCS"] = cfg["models"]["gemini"]
+    env["GROK_MODEL_INTEL"] = cfg["models"].get("grok", "grok-build")
     env["ORCHESTRATOR_CHAIN"] = ",".join(cfg["chains"]["orchestrator"])
     env["IMPLEMENTATION_CHAIN"] = ",".join(cfg["chains"]["implementation"])
     env["UIDOCS_CHAIN"] = ",".join(cfg["chains"]["uidocs"])
     env["REVIEW_CHAIN"] = ",".join(cfg["chains"]["review"])
+    env["INTEL_CHAIN"] = ",".join(cfg["chains"].get("intel", DEFAULTS["chains"]["intel"]))
     unsupported_for_orchestrator: set[str] = set()
     if cfg.get("claude_mode", "cli") == "cli":
         unsupported_for_orchestrator.add("claude")
@@ -1018,8 +1235,10 @@ def _run_orchestrator(task_id: str, cfg: dict) -> int:
         unsupported_for_orchestrator.add("codex")
     if cfg.get("gemini_mode", "api") == "cli":
         unsupported_for_orchestrator.add("gemini")
+    if cfg.get("grok_mode", "cli") == "cli":
+        unsupported_for_orchestrator.add("grok")
     if unsupported_for_orchestrator:
-        for role_key in ("orchestrator", "implementation", "uidocs", "review"):
+        for role_key in ("orchestrator", "implementation", "uidocs", "review", "intel"):
             chain_key = f"{role_key.upper()}_CHAIN"
             agents = [a for a in env[chain_key].split(",") if a and a not in unsupported_for_orchestrator]
             env[chain_key] = ",".join(agents)
@@ -1089,9 +1308,12 @@ def _print_help() -> None:
     print("  /quit                 exit")
     print("  impl: <msg>           force implementation role")
     print("  ui: <msg>             force ui/docs role")
+    print("  intel: <msg>          force intel/research role")
+    print("  x: <msg>              alias for intel role")
     print("  @claude <msg>         send directly to Claude")
     print("  @codex <msg>          send directly to Codex")
     print("  @gemini <msg>         send directly to Gemini")
+    print("  @grok <msg>           send directly to Grok")
 
 
 def run_chat(cfg: dict, initial_task: str | None) -> int:
@@ -1125,6 +1347,7 @@ def run_chat(cfg: dict, initial_task: str | None) -> int:
                 "claude_mode": cfg.get("claude_mode", "cli"),
                 "codex_mode": cfg.get("codex_mode", "api"),
                 "gemini_mode": cfg.get("gemini_mode", "api"),
+                "grok_mode": cfg.get("grok_mode", "cli"),
                 "models": cfg["models"],
             }
             print(json.dumps(payload, indent=2))
@@ -1135,7 +1358,7 @@ def run_chat(cfg: dict, initial_task: str | None) -> int:
         if raw.startswith("/modes set ") or raw.startswith("/permissions set "):
             parts = raw.split()
             if len(parts) != 4:
-                print("Usage: /permissions set <codex|gemini> <full-host-unattended|sandboxed-auto>")
+                print("Usage: /permissions set <codex|gemini|grok> <full-host-unattended|sandboxed-auto>")
                 continue
             _, _, agent, permission_mode = parts
             ok, msg = _set_cli_permission_mode(cfg, agent, permission_mode)
@@ -1234,11 +1457,11 @@ def run_chat(cfg: dict, initial_task: str | None) -> int:
         if raw.startswith("/service down "):
             parts = raw.split()
             if len(parts) != 4:
-                print("Usage: /service down <claude|codex|gemini> <minutes|manual>")
+                print("Usage: /service down <claude|codex|gemini|grok> <minutes|manual>")
                 continue
             _, _, agent, value = parts
             if agent not in AGENTS:
-                print("Unknown agent. Use claude, codex, or gemini.")
+                print("Unknown agent. Use claude, codex, gemini, or grok.")
                 continue
             override = cfg["service_overrides"][agent]
             if value == "manual":
@@ -1267,11 +1490,11 @@ def run_chat(cfg: dict, initial_task: str | None) -> int:
         if raw.startswith("/service up "):
             parts = raw.split()
             if len(parts) != 3:
-                print("Usage: /service up <claude|codex|gemini>")
+                print("Usage: /service up <claude|codex|gemini|grok>")
                 continue
             _, _, agent = parts
             if agent not in AGENTS:
-                print("Unknown agent. Use claude, codex, or gemini.")
+                print("Unknown agent. Use claude, codex, gemini, or grok.")
                 continue
             override = cfg["service_overrides"][agent]
             override["manual_disabled"] = False
