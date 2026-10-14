@@ -8,18 +8,29 @@ import json
 import os
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import urllib.parse
 from getpass import getpass
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-AGENTS = ("claude", "codex", "gemini", "grok")
+AGENTS = ("claude", "codex", "gemini", "grok", "antigravity", "argon")
+# Agents that may only ever appear in the given roles' chains (argon is a paid API reviewer).
+ROLE_RESTRICTED_AGENTS = {"argon": ("review",)}
+# Agents that cost real money per call: never smoke-tested, never addressed directly with @.
+PAID_API_AGENTS = ("argon",)
+ARGON_MODEL = "gemini-4-argon"
+ARGON_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions"
+ARGON_TIMEOUT_SECS = 600
+ANTIGRAVITY_CLI_TIMEOUT_SECS = 1800
 GEMINI_CLI_TIMEOUT_SECS = 300  # 5 minutes (was 120 — too short for complex prompts)
 GROK_CLI_TIMEOUT_SECS = 1800
 GEMINI_KNOWN_MODELS = ("gemini-2.5-pro", "gemini-2.5-flash")
@@ -33,19 +44,24 @@ DEFAULTS = {
     "grok_mode": "cli",
     "codex_cli_permission_mode": "full-host-unattended",
     "gemini_cli_permission_mode": "full-host-unattended",
-    "grok_cli_permission_mode": "full-host-unattended",
+    # Grok and Antigravity default to a sandboxed mode. full-host-unattended is an explicit opt-in.
+    "grok_cli_permission_mode": "sandboxed-auto",
+    "antigravity_mode": "cli",
+    "antigravity_cli_permission_mode": "sandboxed-auto",
     "models": {
         "claude": "claude-sonnet-4-5",
         "codex": "gpt-5",
         "codex_orchestrator": "gpt-5",
         "gemini": "gemini-2.5-pro",
-        "grok": "grok-build",
+        "grok": "grok-4.7",
+        "antigravity": "",  # empty = agy's own default model
+        "argon": ARGON_MODEL,
     },
     "chains": {
         "orchestrator": ["claude", "codex", "gemini", "grok"],
-        "implementation": ["codex", "claude", "gemini", "grok"],
-        "uidocs": ["gemini", "codex", "claude", "grok"],
-        "review": ["claude", "codex", "gemini", "grok"],
+        "implementation": ["codex", "claude", "gemini", "antigravity", "grok"],
+        "uidocs": ["gemini", "codex", "claude", "antigravity", "grok"],
+        "review": ["claude", "codex", "gemini", "antigravity", "argon", "grok"],
         "intel": ["grok", "gemini", "claude", "codex"],
     },
     "keys": {
@@ -59,6 +75,8 @@ DEFAULTS = {
         "codex": {"manual_disabled": False, "disabled_until": ""},
         "gemini": {"manual_disabled": False, "disabled_until": ""},
         "grok": {"manual_disabled": False, "disabled_until": ""},
+        "antigravity": {"manual_disabled": False, "disabled_until": ""},
+        "argon": {"manual_disabled": False, "disabled_until": ""},
     },
     "allowed_dirs": [str(Path.home())],
 }
@@ -73,7 +91,7 @@ _COLORS = sys.stdout.isatty()
 def _c(code: str, text: str) -> str:
     return f"\033[{code}m{text}\033[0m" if _COLORS else text
 
-AGENT_COLORS = {"claude": "35", "codex": "32", "gemini": "34", "grok": "36"}  # magenta, green, blue, cyan
+AGENT_COLORS = {"claude": "35", "codex": "32", "gemini": "34", "grok": "36", "antigravity": "33", "argon": "31"}  # magenta, green, blue, cyan, yellow, red
 
 
 def _read(path: Path) -> str:
@@ -107,6 +125,8 @@ def _load_config() -> dict:
         "codex_cli_permission_mode",
         "gemini_cli_permission_mode",
         "grok_cli_permission_mode",
+        "antigravity_mode",
+        "antigravity_cli_permission_mode",
         "models",
         "chains",
         "keys",
@@ -148,6 +168,15 @@ def _try_save_config(cfg: dict) -> tuple[bool, str]:
 
 
 CLI_PERMISSION_MODES = ("full-host-unattended", "sandboxed-auto")
+SANDBOXED_MODE = "sandboxed-auto"
+FULL_HOST_MODE = "full-host-unattended"
+# Agents whose default permission mode is the sandbox (full-host is opt-in only).
+SANDBOX_DEFAULT_AGENTS = ("grok", "antigravity")
+
+
+def _safe_permission_mode(value: object) -> str:
+    """Anything other than the exact opt-in string falls back to the sandboxed mode."""
+    return FULL_HOST_MODE if str(value or "").strip().lower() == FULL_HOST_MODE else SANDBOXED_MODE
 
 
 def _cli_permissions_payload(cfg: dict) -> dict:
@@ -165,15 +194,20 @@ def _cli_permissions_payload(cfg: dict) -> dict:
         },
         "grok": {
             "mode": cfg.get("grok_mode", "cli"),
-            "permission_mode": cfg.get("grok_cli_permission_mode", "full-host-unattended"),
+            "permission_mode": _safe_permission_mode(cfg.get("grok_cli_permission_mode")),
             "model": cfg["models"]["grok"],
+        },
+        "antigravity": {
+            "mode": cfg.get("antigravity_mode", "cli"),
+            "permission_mode": _safe_permission_mode(cfg.get("antigravity_cli_permission_mode")),
+            "model": cfg["models"].get("antigravity", ""),
         },
     }
 
 
 def _set_cli_permission_mode(cfg: dict, agent: str, permission_mode: str) -> tuple[bool, str]:
-    if agent not in ("codex", "gemini", "grok"):
-        return False, "Only codex, gemini, and grok support runtime CLI permission mode changes."
+    if agent not in ("codex", "gemini", "grok", "antigravity"):
+        return False, "Only codex, gemini, grok, and antigravity support runtime CLI permission mode changes."
     if permission_mode not in CLI_PERMISSION_MODES:
         return False, f"Permission mode must be one of: {', '.join(CLI_PERMISSION_MODES)}"
     key = f"{agent}_cli_permission_mode"
@@ -204,6 +238,10 @@ def _agent_prompt_identity(agent: str) -> str:
         return "You are Claude, the orchestrator/review agent."
     if agent == "grok":
         return "You are Grok, the X/Twitter intelligence and external-signal analysis agent."
+    if agent == "antigravity":
+        return "You are Antigravity, Google's agentic coding assistant (agy), used for implementation, UI/docs and review."
+    if agent == "argon":
+        return "You are Argon, Google's Gemini 4 Argon model, acting as an independent code reviewer."
     return f"You are {agent.title()}, a pragmatic software assistant."
 
 
@@ -216,6 +254,10 @@ def _default_role_for_direct_agent(agent: str) -> str:
         return "review"
     if agent == "grok":
         return "intel"
+    if agent == "antigravity":
+        return "implementation"
+    if agent == "argon":
+        return "review"
     return "orchestrator"
 
 
@@ -225,8 +267,20 @@ def _key_for(agent: str, cfg: dict) -> str:
         "claude": cfg["keys"]["anthropic"] if cfg.get("claude_mode", "cli") == "api" else "cli",
         "gemini": cfg["keys"]["gemini"] if cfg.get("gemini_mode", "api") == "api" else "cli",
         "grok": cfg["keys"]["xai"] if cfg.get("grok_mode", "cli") == "api" else "cli",
+        "antigravity": "cli",
+        "argon": _argon_key(cfg),
     }
     return mapping[agent].strip()
+
+
+def _argon_key(cfg: dict) -> str:
+    """Gemini API key for Argon (config keys, then GEMINI_API_KEY). Never printed."""
+    return (str(cfg.get("keys", {}).get("gemini", "")).strip() or os.environ.get("GEMINI_API_KEY", "").strip())
+
+
+def _antigravity_auth_configured() -> bool:
+    """agy has no non-interactive auth probe; check that its sign-in state directory exists."""
+    return (Path.home() / ".gemini" / "antigravity-cli").is_dir()
 
 
 def _grok_auth_configured(cfg: dict) -> bool:
@@ -264,6 +318,12 @@ def _available(agent: str, cfg: dict) -> bool:
         if mode == "cli":
             return shutil.which("grok") is not None and _grok_auth_configured(cfg)
         return False
+    if agent == "antigravity":
+        if cfg.get("antigravity_mode", "cli") == "cli":
+            return shutil.which("agy") is not None and _antigravity_auth_configured()
+        return False
+    if agent == "argon":
+        return bool(_argon_key(cfg))
     return bool(_key_for(agent, cfg))
 
 
@@ -303,6 +363,10 @@ def _service_disabled_reason(agent: str, cfg: dict, now: datetime | None = None)
 def _service_status(agent: str, cfg: dict) -> str:
     if agent == "grok" and shutil.which("grok") is not None and not _grok_auth_configured(cfg):
         return "unavailable (missing auth: run `grok login --device-auth` or set XAI_API_KEY)"
+    if agent == "antigravity" and shutil.which("agy") is not None and not _antigravity_auth_configured():
+        return "unavailable (not signed in: run `agy` once interactively to sign in)"
+    if agent == "argon" and not _argon_key(cfg):
+        return "unavailable (no Gemini API key: set keys.gemini or GEMINI_API_KEY)"
     if not _available(agent, cfg):
         return "unavailable (missing key/cli)"
     reason = _service_disabled_reason(agent, cfg)
@@ -396,18 +460,91 @@ def _apply_auto_downtime(agent: str, error_text: str, cfg: dict) -> str | None:
             suffix = "" if ok else f" (warning: could not persist config: {err})"
             return f"auto-down: {agent} auth failed. Run `grok login --device-auth` or set XAI_API_KEY, then /service up {agent}.{suffix}"
 
+    if agent == "antigravity":
+        lower = text.lower()
+        # Timeouts are plain errors: no downtime, the chain just moves on.
+        if "timed out" in lower:
+            return None
+        if "rate limit" in lower or re.search(r"\b429\b", lower) or "resource exhausted" in lower or "resource_exhausted" in lower or "quota" in lower:
+            override["disabled_until"] = _format_iso_utc(datetime.now(timezone.utc) + timedelta(minutes=5))
+            ok, err = _try_save_config(cfg)
+            suffix = "" if ok else f" (warning: could not persist config: {err})"
+            return f"auto-down: {agent} rate limited, retry in 5min{suffix}"
+        if (
+            "sign in" in lower
+            or "sign-in" in lower
+            or "signed in" in lower
+            or "not authenticated" in lower
+            or "unauthenticated" in lower
+            or "unauthorized" in lower
+            or re.search(r"\b401\b", lower)
+            or "authentication" in lower
+            or "log in" in lower
+            or "login" in lower
+        ):
+            override["manual_disabled"] = True
+            override["disabled_until"] = ""
+            ok, err = _try_save_config(cfg)
+            suffix = "" if ok else f" (warning: could not persist config: {err})"
+            return f"auto-down: {agent} auth failed. Sign in by running `agy` interactively, then /service up {agent}.{suffix}"
+
+    if agent == "argon":
+        lower = text.lower()
+        if "timed out" in lower:
+            return None
+        # Out of credit / billing / quota: out of rotation until the operator says otherwise.
+        # Argon is prepaid with no card, so we never retry and never top up anything.
+        if (
+            re.search(r"\b402\b", lower)
+            or re.search(r"\b429\b", lower)
+            or "payment required" in lower
+            or "billing" in lower
+            or "insufficient" in lower
+            or "credit" in lower
+            or "prepay" in lower
+            or "quota" in lower
+            or "resource exhausted" in lower
+            or "resource_exhausted" in lower
+            or "rate limit" in lower
+        ):
+            override["manual_disabled"] = True
+            override["disabled_until"] = ""
+            ok, err = _try_save_config(cfg)
+            suffix = "" if ok else f" (warning: could not persist config: {err})"
+            return f"auto-down: {agent} out of credit/quota. Out of rotation until /service up {agent}; nothing is retried or topped up.{suffix}"
+        if (
+            re.search(r"\b40[13]\b", lower)
+            or "api key" in lower
+            or "api_key_invalid" in lower
+            or "permission_denied" in lower
+            or "unauthorized" in lower
+        ):
+            override["manual_disabled"] = True
+            override["disabled_until"] = ""
+            ok, err = _try_save_config(cfg)
+            suffix = "" if ok else f" (warning: could not persist config: {err})"
+            return f"auto-down: {agent} auth failed. Check the Gemini API key then /service up {agent}.{suffix}"
+
     return None
 
 
+def _agent_allowed_in_role(agent: str, role: str) -> bool:
+    allowed_roles = ROLE_RESTRICTED_AGENTS.get(agent)
+    return allowed_roles is None or role in allowed_roles
+
+
 def _role_chain(role: str, cfg: dict) -> list[str]:
+    def ok(a: str) -> bool:
+        return _agent_allowed_in_role(a, role) and _available(a, cfg) and not _service_disabled_reason(a, cfg)
+
     configured = list(cfg["chains"].get(role, []))
-    filtered = [a for a in configured if _available(a, cfg) and not _service_disabled_reason(a, cfg)]
+    filtered = [a for a in configured if ok(a)]
     if filtered:
         return filtered
-    defaults = [a for a in DEFAULTS["chains"][role] if _available(a, cfg) and not _service_disabled_reason(a, cfg)]
+    defaults = [a for a in DEFAULTS["chains"][role] if ok(a)]
     if defaults:
         return defaults
-    return [a for a in AGENTS if _available(a, cfg) and not _service_disabled_reason(a, cfg)]
+    return [a for a in AGENTS if ok(a)]
 
 
 def _extract_openai_text(resp: object) -> str:
@@ -695,49 +832,132 @@ def _call_gemini(prompt: str, cfg: dict) -> str:
     raise RuntimeError(f"Unsupported gemini_mode: {mode}")
 
 
+# Environment variables an unattended agent CLI may inherit. Everything else (cloud keys,
+# tokens, DB URLs, ...) is deliberately NOT passed to the child process.
+CLI_ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "TERM", "TMPDIR", "USER", "LOGNAME")
+CLI_ENV_ALLOW_PREFIXES = ("LC_",)
+
+
+def _minimal_cli_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key in CLI_ENV_ALLOWLIST or key.startswith(CLI_ENV_ALLOW_PREFIXES):
+            env[key] = value
+    for key, value in (extra or {}).items():
+        if value:
+            env[key] = value
+    return env
+
+
+def _job_workdir(cfg: dict, agent: str) -> str:
+    """Directory an unattended CLI agent works in: where Daniel was started if approved, else the
+    configured task dir. Never $HOME itself."""
+    home = str(Path.home().resolve())
+    candidates: list[str] = []
+    try:
+        here = Path.cwd().resolve()
+        if _is_allowed_dir(here, cfg):
+            candidates.append(str(here))
+    except OSError:
+        pass
+    fallback = _cli_workdir(cfg)
+    if fallback:
+        candidates.append(fallback)
+    for cand in candidates:
+        if str(Path(cand).resolve()) != home:
+            return cand
+    raise RuntimeError(
+        f"{agent}: refusing to run with $HOME as its working directory. "
+        "Start Daniel inside a project directory (add it with /allow-dir add <path>)."
+    )
+
+
+def _cli_timeout_secs(cfg: dict, name: str, default: int) -> int:
+    raw = os.environ.get(f"DANIEL_{name.upper()}_TIMEOUT_SECS") or cfg.get(f"{name}_timeout_secs")
+    try:
+        value = int(raw)
+        return value if value > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _run_cli(cmd: list[str], cwd: str, env: dict[str, str], timeout: int, label: str) -> subprocess.CompletedProcess:
+    """Run an agent CLI in its own process group so timeouts and Ctrl-C kill the whole tree."""
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+    def _kill_group() -> None:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(proc.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                return
+            try:
+                proc.wait(timeout=5)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group()
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        raise RuntimeError(f"{label} CLI timed out after {timeout}s")
+    except BaseException:
+        _kill_group()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+def _grok_model(cfg: dict) -> str:
+    """Configured Grok model; "" means grok's own default. "grok-build" was an invalid id in an
+    earlier default (grok 1.0.50 rejects it), so it is treated as unset."""
+    model = str(cfg.get("models", {}).get("grok", "")).strip()
+    return "" if model == "grok-build" else model
+
+
+def _grok_cli_command(prompt_path: str, cli_cwd: str, model: str, permission_mode: str) -> list[str]:
+    cmd = ["grok", "--prompt-file", prompt_path, "--cwd", cli_cwd]
+    if model:
+        cmd.extend(["--model", model])
+    cmd.extend(["--output-format", "json", "--no-plan"])
+    if _safe_permission_mode(permission_mode) == FULL_HOST_MODE:
+        # Explicit opt-in only. Use inside a container/VM.
+        cmd.extend(["--always-approve", "--permission-mode", "bypassPermissions", "--sandbox", "off"])
+    else:
+        # Grok's own workspace sandbox; edits inside the workspace are accepted, nothing is bypassed.
+        cmd.extend(["--sandbox", "workspace", "--permission-mode", "acceptEdits"])
+    return cmd
+
+
 def _call_grok_cli(prompt: str, cfg: dict) -> str:
     if shutil.which("grok") is None:
         raise RuntimeError("Grok CLI not found on PATH")
     if not _grok_auth_configured(cfg):
         raise RuntimeError("Grok CLI not authenticated. Run `grok login --device-auth` or set XAI_API_KEY.")
-    cli_cwd = _cli_workdir(cfg) or str(Path.home())
-    model = str(cfg.get("models", {}).get("grok", "grok-build")).strip() or "grok-build"
+    cli_cwd = _job_workdir(cfg, "grok")
+    model = _grok_model(cfg)
     with tempfile.NamedTemporaryFile(prefix="daniel-grok-", suffix=".txt", mode="w", encoding="utf-8", delete=False) as tmp:
         tmp.write(prompt)
         prompt_path = tmp.name
-    permission_mode = cfg.get("grok_cli_permission_mode", "full-host-unattended")
-    cmd = [
-        "grok",
-        "--prompt-file",
-        prompt_path,
-        "--cwd",
-        cli_cwd,
-        "--model",
-        model,
-        "--output-format",
-        "json",
-        "--no-plan",
-    ]
-    if permission_mode == "full-host-unattended":
-        cmd.extend(["--always-approve", "--permission-mode", "bypassPermissions", "--sandbox", "off"])
-    else:
-        cmd.extend(["--always-approve", "--sandbox", "workspace"])
-    env = os.environ.copy()
-    xai_key = str(cfg.get("keys", {}).get("xai", "")).strip()
-    if xai_key and not env.get("XAI_API_KEY"):
-        env["XAI_API_KEY"] = xai_key
+    cmd = _grok_cli_command(prompt_path, cli_cwd, model, cfg.get("grok_cli_permission_mode"))
+    xai_key = os.environ.get("XAI_API_KEY", "").strip() or str(cfg.get("keys", {}).get("xai", "")).strip()
+    env = _minimal_cli_env({"XAI_API_KEY": xai_key})
+    timeout = _cli_timeout_secs(cfg, "grok", GROK_CLI_TIMEOUT_SECS)
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=cli_cwd,
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            timeout=GROK_CLI_TIMEOUT_SECS,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"grok CLI timed out after {GROK_CLI_TIMEOUT_SECS}s")
+        proc = _run_cli(cmd, cli_cwd, env, timeout, "grok")
     finally:
         try:
             os.remove(prompt_path)
@@ -772,6 +992,122 @@ def _call_grok(prompt: str, cfg: dict) -> str:
     raise RuntimeError(f"Unsupported grok_mode: {mode}")
 
 
+def _antigravity_cli_command(prompt: str, model: str, permission_mode: str, timeout: int) -> list[str]:
+    cmd = [
+        "agy",
+        "--print",
+        prompt,
+        "--output-format",
+        "json",
+        "--print-timeout",
+        f"{timeout}s",
+    ]
+    if model:
+        cmd.extend(["--model", model])
+    if _safe_permission_mode(permission_mode) == FULL_HOST_MODE:
+        # Explicit opt-in only. Use inside a container/VM.
+        cmd.append("--dangerously-skip-permissions")
+    else:
+        cmd.extend(["--sandbox", "--mode", "accept-edits"])
+    return cmd
+
+
+def _call_antigravity_cli(prompt: str, cfg: dict) -> str:
+    if shutil.which("agy") is None:
+        raise RuntimeError("Antigravity CLI (agy) not found on PATH")
+    if not _antigravity_auth_configured():
+        raise RuntimeError("Antigravity CLI not signed in. Run `agy` once interactively to sign in.")
+    cli_cwd = _job_workdir(cfg, "antigravity")
+    timeout = _cli_timeout_secs(cfg, "antigravity", ANTIGRAVITY_CLI_TIMEOUT_SECS)
+    model = str(cfg.get("models", {}).get("antigravity", "")).strip()
+    cmd = _antigravity_cli_command(prompt, model, cfg.get("antigravity_cli_permission_mode"), timeout)
+    # agy enforces --print-timeout itself; the outer limit only catches a hung process.
+    proc = _run_cli(cmd, cli_cwd, _minimal_cli_env(), timeout + 30, "antigravity")
+    raw_stdout = (proc.stdout or "").strip()
+    raw_stderr = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        err = raw_stderr or raw_stdout or f"exit {proc.returncode}"
+        raise RuntimeError(f"antigravity CLI failed: {err}")
+    if "print timeout" in raw_stderr.lower():
+        raise RuntimeError(f"antigravity CLI timed out after {timeout}s")
+    if not raw_stdout:
+        if raw_stderr:
+            raise RuntimeError(f"antigravity CLI empty output, stderr: {raw_stderr}")
+        return "<empty response>"
+    try:
+        parsed = json.loads(raw_stdout)
+    except json.JSONDecodeError:
+        return raw_stdout
+    if isinstance(parsed, dict):
+        status = str(parsed.get("status", "SUCCESS")).upper()
+        response = parsed.get("response")
+        if status not in ("SUCCESS", "OK", "COMPLETED"):
+            detail = (response if isinstance(response, str) and response.strip() else raw_stderr) or raw_stdout
+            raise RuntimeError(f"antigravity CLI failed ({status}): {detail}")
+        if isinstance(response, str) and response.strip():
+            return response.strip()
+        return "<empty response>"
+    return raw_stdout
+
+
+def _call_antigravity(prompt: str, cfg: dict) -> str:
+    mode = cfg.get("antigravity_mode", "cli")
+    if mode == "cli":
+        return _call_antigravity_cli(prompt, cfg)
+    raise RuntimeError(f"Unsupported antigravity_mode: {mode}")
+
+
+def _argon_response_text(parsed: object) -> str:
+    if not isinstance(parsed, dict):
+        return ""
+    chunks: list[str] = []
+    for step in parsed.get("steps") or []:
+        if isinstance(step, dict) and step.get("type") == "model_output":
+            for item in step.get("content") or []:
+                if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                    chunks.append(item["text"])
+    if chunks:
+        return "".join(chunks).strip()
+    text = parsed.get("output_text")
+    return text.strip() if isinstance(text, str) else ""
+
+
+def _call_argon(prompt: str, cfg: dict) -> str:
+    """Gemini 4 Argon via the Gemini Interactions API. Single attempt, never retried."""
+    key = _argon_key(cfg)
+    if not key:
+        raise RuntimeError("Argon needs a Gemini API key (keys.gemini or GEMINI_API_KEY)")
+    model = str(cfg.get("models", {}).get("argon", "")).strip() or ARGON_MODEL
+    timeout = _cli_timeout_secs(cfg, "argon", ARGON_TIMEOUT_SECS)
+    body = json.dumps({"model": model, "input": prompt}).encode("utf-8")
+    req = urllib.request.Request(
+        ARGON_ENDPOINT,
+        data=body,
+        method="POST",
+        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"argon API HTTP {exc.code}: {_truncate(detail.strip() or str(exc.reason), 500)}")
+    except (TimeoutError, socket.timeout):
+        raise RuntimeError(f"argon API timed out after {timeout}s")
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise RuntimeError(f"argon API timed out after {timeout}s")
+        raise RuntimeError(f"argon API request failed: {exc.reason}")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"argon API returned non-JSON: {_truncate(raw, 300)}")
+    return _argon_response_text(parsed) or "<empty response>"
+
+
 def _call_agent(agent: str, prompt: str, cfg: dict, role: str) -> str:
     if agent == "codex":
         return _call_codex(prompt, cfg, role)
@@ -781,6 +1117,10 @@ def _call_agent(agent: str, prompt: str, cfg: dict, role: str) -> str:
         return _call_gemini(prompt, cfg)
     if agent == "grok":
         return _call_grok(prompt, cfg)
+    if agent == "antigravity":
+        return _call_antigravity(prompt, cfg)
+    if agent == "argon":
+        return _call_argon(prompt, cfg)
     raise RuntimeError(f"Unknown agent: {agent}")
 
 
@@ -989,6 +1329,8 @@ def _route_message(raw: str) -> tuple[str, str, str | None]:
         return "intel", user_text[2:].strip(), None
     lowered = user_text.lower()
     for agent_name in AGENTS:
+        if agent_name in PAID_API_AGENTS:
+            continue  # argon is only reachable through the review chain
         prefix = f"@{agent_name} "
         if lowered.startswith(prefix):
             direct_agent = agent_name
@@ -1023,6 +1365,9 @@ def _smoke_test(cfg: dict, task_id: str | None) -> int:
     print("Smoke test start")
     rc = 0
     for agent in AGENTS:
+        if agent in PAID_API_AGENTS:
+            print(f"- {agent}: skipped (paid API; not smoke-tested)")
+            continue
         status = _service_status(agent, cfg)
         if status.startswith("down") or status.startswith("unavailable"):
             print(f"- {agent}: skipped ({status})")
@@ -1052,7 +1397,8 @@ def _write_tasks_env(cfg: dict) -> None:
         f"OPENAI_MODEL_ORCHESTRATOR_FALLBACK={cfg['models']['codex_orchestrator']}",
         f"ANTHROPIC_MODEL_ORCHESTRATOR={cfg['models']['claude']}",
         f"GEMINI_MODEL_UI_DOCS={cfg['models']['gemini']}",
-        f"GROK_MODEL_INTEL={cfg['models'].get('grok', 'grok-build')}",
+        f"GROK_MODEL_INTEL={cfg['models'].get('grok', 'grok-4.7')}",
+        f"ARGON_MODEL_REVIEW={cfg['models'].get('argon', ARGON_MODEL)}",
         "",
         f"ORCHESTRATOR_CHAIN={','.join(cfg['chains']['orchestrator'])}",
         f"IMPLEMENTATION_CHAIN={','.join(cfg['chains']['implementation'])}",
@@ -1120,12 +1466,16 @@ def setup_wizard(cfg: dict, force: bool = False) -> dict:
         grok_mode = "cli"
     cfg["grok_mode"] = grok_mode
     grok_perm = _prompt(
-        "Grok CLI permission mode (full-host-unattended/sandboxed-auto)",
-        cfg.get("grok_cli_permission_mode", "full-host-unattended"),
+        "Grok CLI permission mode (sandboxed-auto/full-host-unattended; full-host only inside a container/VM)",
+        _safe_permission_mode(cfg.get("grok_cli_permission_mode")),
     ).lower()
-    if grok_perm not in ("full-host-unattended", "sandboxed-auto"):
-        grok_perm = "full-host-unattended"
-    cfg["grok_cli_permission_mode"] = grok_perm
+    cfg["grok_cli_permission_mode"] = _safe_permission_mode(grok_perm)
+    cfg["antigravity_mode"] = "cli"
+    agy_perm = _prompt(
+        "Antigravity (agy) CLI permission mode (sandboxed-auto/full-host-unattended; full-host only inside a container/VM)",
+        _safe_permission_mode(cfg.get("antigravity_cli_permission_mode")),
+    ).lower()
+    cfg["antigravity_cli_permission_mode"] = _safe_permission_mode(agy_perm)
 
     existing_openai = cfg["keys"]["openai"] if cfg["keys"]["openai"] and not force else ""
     existing_anthropic = cfg["keys"]["anthropic"] if cfg["keys"]["anthropic"] and not force else ""
@@ -1163,9 +1513,11 @@ def setup_wizard(cfg: dict, force: bool = False) -> dict:
         has_provider = True
     if cfg["grok_mode"] == "cli" and shutil.which("grok"):
         has_provider = True
+    if cfg.get("antigravity_mode", "cli") == "cli" and shutil.which("agy"):
+        has_provider = True
     if not has_provider:
         raise RuntimeError(
-            "No usable provider configured. Add at least one API key, or use Claude/Codex/Gemini/Grok in cli mode with their CLIs installed."
+            "No usable provider configured. Add at least one API key, or use Claude/Codex/Gemini/Grok/Antigravity in cli mode with their CLIs installed."
         )
 
     print("\nModel IDs (use exact account IDs if custom):")
@@ -1175,9 +1527,13 @@ def setup_wizard(cfg: dict, force: bool = False) -> dict:
         "Codex fallback orchestrator model", cfg["models"]["codex_orchestrator"]
     )
     cfg["models"]["gemini"] = _prompt("Gemini model", cfg["models"]["gemini"])
-    cfg["models"]["grok"] = _prompt("Grok model", cfg["models"].get("grok", "grok-build"))
+    cfg["models"]["grok"] = _prompt("Grok model", cfg["models"].get("grok", "grok-4.7"))
+    cfg["models"]["antigravity"] = _prompt(
+        "Antigravity model (blank = agy default)", cfg["models"].get("antigravity", "")
+    )
+    cfg["models"]["argon"] = _prompt("Argon model (Gemini API id)", cfg["models"].get("argon", ARGON_MODEL))
 
-    print("\nRole fallback chains (comma separated, values: claude,codex,gemini,grok):")
+    print("\nRole fallback chains (comma separated, values: claude,codex,gemini,grok,antigravity,argon; argon is honoured in REVIEW_CHAIN only):")
     cfg["chains"]["orchestrator"] = _parse_chain(
         _prompt("ORCHESTRATOR_CHAIN", ",".join(cfg["chains"]["orchestrator"])),
         DEFAULTS["chains"]["orchestrator"],
@@ -1198,6 +1554,8 @@ def setup_wizard(cfg: dict, force: bool = False) -> dict:
         _prompt("INTEL_CHAIN", ",".join(cfg["chains"].get("intel", DEFAULTS["chains"]["intel"]))),
         DEFAULTS["chains"]["intel"],
     )
+    for role_key in ("orchestrator", "implementation", "uidocs", "review", "intel"):
+        cfg["chains"][role_key] = [a for a in cfg["chains"][role_key] if _agent_allowed_in_role(a, role_key)]
 
     _save_config(cfg)
     _write_tasks_env(cfg)
@@ -1222,7 +1580,7 @@ def _run_orchestrator(task_id: str, cfg: dict) -> int:
     env["OPENAI_MODEL_ORCHESTRATOR_FALLBACK"] = cfg["models"]["codex_orchestrator"]
     env["ANTHROPIC_MODEL_ORCHESTRATOR"] = cfg["models"]["claude"]
     env["GEMINI_MODEL_UI_DOCS"] = cfg["models"]["gemini"]
-    env["GROK_MODEL_INTEL"] = cfg["models"].get("grok", "grok-build")
+    env["GROK_MODEL_INTEL"] = cfg["models"].get("grok", "grok-4.7")
     env["ORCHESTRATOR_CHAIN"] = ",".join(cfg["chains"]["orchestrator"])
     env["IMPLEMENTATION_CHAIN"] = ",".join(cfg["chains"]["implementation"])
     env["UIDOCS_CHAIN"] = ",".join(cfg["chains"]["uidocs"])
@@ -1237,6 +1595,8 @@ def _run_orchestrator(task_id: str, cfg: dict) -> int:
         unsupported_for_orchestrator.add("gemini")
     if cfg.get("grok_mode", "cli") == "cli":
         unsupported_for_orchestrator.add("grok")
+    # The external orchestrator.py has no adapter for these two.
+    unsupported_for_orchestrator.update(("antigravity", "argon"))
     if unsupported_for_orchestrator:
         for role_key in ("orchestrator", "implementation", "uidocs", "review", "intel"):
             chain_key = f"{role_key.upper()}_CHAIN"
@@ -1314,6 +1674,7 @@ def _print_help() -> None:
     print("  @codex <msg>          send directly to Codex")
     print("  @gemini <msg>         send directly to Gemini")
     print("  @grok <msg>           send directly to Grok")
+    print("  @antigravity <msg>    send directly to Antigravity (agy)")
 
 
 def run_chat(cfg: dict, initial_task: str | None) -> int:
@@ -1348,6 +1709,7 @@ def run_chat(cfg: dict, initial_task: str | None) -> int:
                 "codex_mode": cfg.get("codex_mode", "api"),
                 "gemini_mode": cfg.get("gemini_mode", "api"),
                 "grok_mode": cfg.get("grok_mode", "cli"),
+                "antigravity_mode": cfg.get("antigravity_mode", "cli"),
                 "models": cfg["models"],
             }
             print(json.dumps(payload, indent=2))
@@ -1358,7 +1720,7 @@ def run_chat(cfg: dict, initial_task: str | None) -> int:
         if raw.startswith("/modes set ") or raw.startswith("/permissions set "):
             parts = raw.split()
             if len(parts) != 4:
-                print("Usage: /permissions set <codex|gemini|grok> <full-host-unattended|sandboxed-auto>")
+                print("Usage: /permissions set <codex|gemini|grok|antigravity> <full-host-unattended|sandboxed-auto>")
                 continue
             _, _, agent, permission_mode = parts
             ok, msg = _set_cli_permission_mode(cfg, agent, permission_mode)
@@ -1457,11 +1819,11 @@ def run_chat(cfg: dict, initial_task: str | None) -> int:
         if raw.startswith("/service down "):
             parts = raw.split()
             if len(parts) != 4:
-                print("Usage: /service down <claude|codex|gemini|grok> <minutes|manual>")
+                print("Usage: /service down <claude|codex|gemini|grok|antigravity|argon> <minutes|manual>")
                 continue
             _, _, agent, value = parts
             if agent not in AGENTS:
-                print("Unknown agent. Use claude, codex, gemini, or grok.")
+                print("Unknown agent. Use claude, codex, gemini, grok, antigravity, or argon.")
                 continue
             override = cfg["service_overrides"][agent]
             if value == "manual":
@@ -1490,11 +1852,11 @@ def run_chat(cfg: dict, initial_task: str | None) -> int:
         if raw.startswith("/service up "):
             parts = raw.split()
             if len(parts) != 3:
-                print("Usage: /service up <claude|codex|gemini|grok>")
+                print("Usage: /service up <claude|codex|gemini|grok|antigravity|argon>")
                 continue
             _, _, agent = parts
             if agent not in AGENTS:
-                print("Unknown agent. Use claude, codex, gemini, or grok.")
+                print("Unknown agent. Use claude, codex, gemini, grok, antigravity, or argon.")
                 continue
             override = cfg["service_overrides"][agent]
             override["manual_disabled"] = False
