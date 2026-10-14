@@ -1,8 +1,8 @@
 # agent-orchestrator
 
-**Three AI agents. One brain. Zero downtime.**
+**Four AI agents. One brain. Zero downtime.**
 
-A terminal-based multi-agent orchestrator that wraps Claude, Codex, and Gemini CLIs with automatic failover. When one agent hits its limit, the next one picks up seamlessly. All agents share context through a knowledge base server. $60/month for three premium AI agents — no API billing.
+A terminal-based multi-agent orchestrator that wraps Claude, Codex, Gemini, Grok, and Antigravity CLIs (plus an optional Argon API reviewer) with automatic failover. When one agent hits its limit, the next one picks up seamlessly. All agents share context through a knowledge base server.
 
 ## How It Works
 
@@ -21,16 +21,21 @@ You type a message
        |         Failed/Down
        |            |
        +---> Try Agent 3 (Gemini) --> Success? Return response
+       |            |
+       |         Failed/Down
+       |            |
+       +---> Try Agent 4 (Grok) ----> Success? Return response
        |
   All failed? Show error + recovery options
 ```
 
 Each message is routed through a **role chain** — an ordered list of agents to try. Roles include:
 
-- **orchestrator** — planning, architecture, high-level reasoning (default: Claude > Codex > Gemini)
-- **implementation** — code execution, build tasks (default: Codex > Claude > Gemini)
-- **uidocs** — frontend, design, documentation (default: Gemini > Codex > Claude)
-- **review** — code review, validation (default: Claude > Codex > Gemini)
+- **orchestrator** — planning, architecture, high-level reasoning (default: Claude > Codex > Gemini > Grok)
+- **implementation** — code execution, build tasks (default: Codex > Claude > Gemini > Antigravity > Grok)
+- **uidocs** — frontend, design, documentation (default: Gemini > Codex > Claude > Antigravity > Grok)
+- **review** — code review, validation (default: Claude > Codex > Gemini > Antigravity > Argon > Grok; Argon only when a Gemini API key is set)
+- **intel** — X/social signal and external research (default: Grok > Gemini > Claude > Codex)
 
 Every role, chain order, and model is configurable.
 
@@ -38,9 +43,9 @@ Every role, chain order, and model is configurable.
 
 - **Next-man-up failover** — if an agent is down, the next one in the chain takes over automatically
 - **Auto-downtime detection** — detects rate limits, quota exhaustion, auth failures, and auto-disables agents with cooldown timers
-- **CLI wrapping** — uses your existing Claude/Codex/Gemini CLI subscriptions, not per-token API billing
-- **Full-host unattended CLI defaults** — Codex and Gemini can run headlessly with full permissions on trusted machines
-- **API mode available** — switch any agent to API mode if you prefer
+- **CLI wrapping** — uses your existing Claude/Codex/Gemini/Grok CLI subscriptions, not per-token API billing
+- **Full-host unattended CLI defaults** — Codex and Gemini can run headlessly with full permissions on trusted machines. Grok and Antigravity default to a sandbox instead (see "Grok and Antigravity: sandboxed by default")
+- **API mode available for supported providers** — switch API-backed agents when you prefer keys over CLI auth
 - **Configurable name** — call it whatever you want, not hardcoded
 - **Knowledge base integration** — searches your KB server for relevant context before every response
 - **Colored output** — each agent has its own color for easy identification
@@ -91,6 +96,9 @@ ln -s $(pwd)/daniel.py ~/.local/bin/agent-orchestrator
   - `claude` — [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
   - `codex` — [OpenAI Codex CLI](https://github.com/openai/codex)
   - `gemini` — [Google Gemini CLI](https://github.com/google-gemini/gemini-cli)
+  - `grok` — [xAI Grok Build CLI](https://x.ai/cli)
+  - `agy` — Google Antigravity CLI
+- Optional: a Gemini API key for the Argon reviewer
 
 ## Commands
 
@@ -123,6 +131,10 @@ ui: <message>         Route to UI/docs chain
 @claude <message>     Send directly to Claude
 @codex <message>      Send directly to Codex
 @gemini <message>     Send directly to Gemini
+@grok <message>       Send directly to Grok
+@antigravity <message> Send directly to Antigravity (agy)
+intel: <message>      Route to Grok-first intel/research chain
+x: <message>          Alias for intel
 ```
 
 ## Cost Model
@@ -132,7 +144,8 @@ ui: <message>         Route to UI/docs chain
 | Claude Pro | ~$20 | Claude Code CLI with Opus |
 | OpenAI subscription | ~$20 | Codex CLI |
 | Google subscription | ~$20 | Gemini CLI |
-| **Total** | **~$60** | **Three premium AI agents** |
+| xAI subscription/API | varies | Grok Build CLI |
+| **Total** | **varies** | **Four premium AI agents** |
 
 No per-token API billing. CLI wrapping uses your subscription tiers. When one agent hits its usage cap, the orchestrator automatically routes to the next available agent.
 
@@ -176,25 +189,33 @@ Config lives at `~/.config/agent-orchestrator/config.json`:
   "claude_mode": "cli",
   "codex_mode": "cli",
   "gemini_mode": "cli",
+  "grok_mode": "cli",
   "codex_cli_permission_mode": "full-host-unattended",
   "gemini_cli_permission_mode": "full-host-unattended",
+  "grok_cli_permission_mode": "sandboxed-auto",
+  "antigravity_mode": "cli",
+  "antigravity_cli_permission_mode": "sandboxed-auto",
   "models": {
     "claude": "claude-sonnet-4-5",
     "codex": "gpt-5",
-    "gemini": "gemini-2.5-pro"
+    "gemini": "gemini-2.5-pro",
+    "grok": "grok-4.7",
+    "antigravity": "",
+    "argon": "gemini-4-argon"
   },
   "chains": {
-    "orchestrator": ["claude", "codex", "gemini"],
-    "implementation": ["codex", "claude", "gemini"],
-    "uidocs": ["gemini", "codex", "claude"],
-    "review": ["claude", "codex", "gemini"]
+    "orchestrator": ["claude", "codex", "gemini", "grok"],
+    "implementation": ["codex", "claude", "gemini", "antigravity", "grok"],
+    "uidocs": ["gemini", "codex", "claude", "antigravity", "grok"],
+    "review": ["claude", "codex", "gemini", "antigravity", "argon", "grok"],
+    "intel": ["grok", "gemini", "claude", "codex"]
   }
 }
 ```
 
 Everything is configurable. Change the name, reorder chains, swap models, switch between CLI and API mode per agent.
 
-At runtime, you can inspect or change Codex/Gemini CLI permission modes without rerunning setup:
+At runtime, you can inspect or change Codex/Gemini/Grok/Antigravity CLI permission modes without rerunning setup:
 
 ```bash
 /modes
@@ -206,11 +227,44 @@ At runtime, you can inspect or change Codex/Gemini CLI permission modes without 
 - Codex uses `--dangerously-bypass-approvals-and-sandbox`
 - Gemini uses `--approval-mode yolo --sandbox=false`
 
-If you want sandboxed automatic execution instead, switch either permission mode to `sandboxed-auto`.
+If you want sandboxed automatic execution instead, switch a permission mode to `sandboxed-auto`.
+
+### Grok and Antigravity: sandboxed by default
+
+Grok and Antigravity run with real shell and file tools, so their default is the sandbox, not the host:
+
+| Mode | Grok | Antigravity (`agy`) |
+|------|------|---------------------|
+| `sandboxed-auto` (default) | `--sandbox workspace --permission-mode acceptEdits` | `--sandbox --mode accept-edits` |
+| `full-host-unattended` (opt-in) | `--always-approve --permission-mode bypassPermissions --sandbox off` | `--dangerously-skip-permissions` |
+
+- Any value other than exactly `full-host-unattended` (including a typo in the setup wizard) falls back to `sandboxed-auto`.
+- Opt in only inside a container or VM: `/permissions set grok full-host-unattended`, `/permissions set antigravity full-host-unattended`. An existing `config.json` written by an older version may already contain `"grok_cli_permission_mode": "full-host-unattended"`; run `/permissions set grok sandboxed-auto` to move it to the safe default.
+- Both CLIs get a minimal environment (`PATH`, `HOME`, `LANG`/`LC_*`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`, plus `XAI_API_KEY` for Grok if set), not a copy of your shell environment. Other secrets in your shell are not visible to them.
+- Their working directory is the directory you started Daniel in if it is an approved directory (`/allow-dir`), otherwise the tasks directory. Daniel refuses to run them with `$HOME` itself as the working directory.
+- Timeouts default to 1800s (`DANIEL_GROK_TIMEOUT_SECS` / `DANIEL_ANTIGRAVITY_TIMEOUT_SECS`, or `grok_timeout_secs` / `antigravity_timeout_secs` in config). On timeout or Ctrl-C the whole process group is killed.
+
+### Signing in
+
+- Grok: `grok login --device-auth` (or set `XAI_API_KEY`).
+- Antigravity: run `agy` once interactively and sign in with your Google account. Daniel treats `~/.gemini/antigravity-cli` existing as "signed in" (agy has no non-interactive auth check); a sign-in failure at run time puts it down until `/service up antigravity`.
+
+### Argon (optional API reviewer)
+
+Argon (`gemini-4-argon`, Gemini Interactions API) is used only in the `review` chain, and only when a Gemini API key is configured (`keys.gemini` or `GEMINI_API_KEY`). It cannot be addressed with `@`, is skipped by `/smoke`, and is dropped from any non-review chain. It is a pay-per-token API and there is **no spending cap**: the intended setup is a prepaid account with no card, so when the money runs out, it runs out. Instead Daniel classifies out-of-credit, billing, 402, quota and 429/RESOURCE_EXHAUSTED errors and takes Argon out of rotation until you run `/service up argon`. A call is never retried, and Daniel never buys or tops up anything. Timeouts are plain errors and do not disable it.
+
+## Running the tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests -q
+```
+
+The tests mock all subprocesses and network calls.
 
 ## Safety Note
 
-The default CLI permission mode assumes you trust the host machine and the projects you point the agents at. In `full-host-unattended`, Codex and Gemini can act without pausing for human approval. Use `sandboxed-auto` if you want lower-friction automation with sandbox boundaries still enforced.
+The Codex and Gemini default CLI permission mode assumes you trust the host machine and the projects you point the agents at (Grok and Antigravity default to a sandbox, see above). In `full-host-unattended`, Codex and Gemini can act without pausing for human approval. Use `sandboxed-auto` if you want lower-friction automation with sandbox boundaries still enforced.
 
 ## Auto-Downtime Detection
 
@@ -221,6 +275,8 @@ The orchestrator automatically detects when agents are unavailable:
 | Claude usage cap exhausted | Disable until reset time | Auto-recovers at reset |
 | Rate limit (any agent) | 5-minute cooldown | Auto-recovers |
 | Auth failure | Manual disable | `/service up <agent>` |
+| Antigravity/Argon quota or 429 | Antigravity: 5-minute cooldown. Argon: manual disable (out of credit) | Argon: `/service up argon` |
+| Timeout | Plain error, next agent tries | none |
 | Model not found | Manual disable | Fix model, `/service up` |
 | CLI not found | Marked unavailable | Install CLI |
 
@@ -237,6 +293,9 @@ daniel.py (single file, ~1100 lines)
   |     +-- _call_claude_cli()  / _call_claude_api()
   |     +-- _call_codex_cli()   / _call_codex_api()
   |     +-- _call_gemini_cli()  / _call_gemini_api()
+  |     +-- _call_grok_cli()
+  |     +-- _call_antigravity_cli()
+  |     +-- _call_argon()  (review chain only)
   |
   +-- Failover: _role_chain() -> _chat_once() -> try each agent
   |
